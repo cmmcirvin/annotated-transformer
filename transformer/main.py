@@ -11,7 +11,7 @@ class EncoderDecoder(nn.Module):
     def __init__(self, h, d_model, d_ff, dropout, N, src_vocab, tgt_vocab):
         super().__init__()
 
-        self.encoder = Encoder(EncoderLayer(h, d_model, d_ff, dropout), N)
+        self.encoder = Encoder(h, d_model, d_ff, dropout, N)
         self.decoder = Decoder(DecoderLayer(h, d_model, d_ff, dropout), N)
         self.src_embed = nn.Sequential(
             Embeddings(d_model, src_vocab),
@@ -47,10 +47,13 @@ def clones(module, N):
 class Encoder(nn.Module):
     "Core encoder is a stack of N layers"
 
-    def __init__(self, layer, N):
-        super(Encoder, self).__init__()
-        self.layers = clones(layer, N)
-        self.norm = LayerNorm(layer.size)
+    def __init__(self, h, d_model, d_ff, dropout, N):
+        super().__init__()
+
+        self.layers = nn.ModuleList(
+            [EncoderLayer(h, d_model, d_ff, dropout) for _ in range(N)]
+        )
+        self.norm = LayerNorm(d_model)
 
     def forward(self, x, mask):
         "Pass the input (and mask) through each layer in turn."
@@ -61,7 +64,7 @@ class Encoder(nn.Module):
 
 class LayerNorm(nn.Module):
     def __init__(self, features, eps=1e-6):
-        super(LayerNorm, self).__init__()
+        super().__init__()
         self.a_2 = nn.Parameter(torch.ones(features))
         self.b_2 = nn.Parameter(torch.zeros(features))
         self.eps = eps
@@ -378,6 +381,8 @@ def greedy_decode(model, src, src_mask, max_len, start_symbol):
 def example_simple_model():
     V = 11
     criterion = LabelSmoothing(size=V, padding_idx=0, smoothing=0.0)
+
+    # h is number of heads
 
     model = EncoderDecoder(
         h=8,
