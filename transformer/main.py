@@ -4,18 +4,27 @@ import time
 
 import torch
 import torch.nn as nn
-from torch.nn.functional import log_softmax
 from torch.optim.lr_scheduler import LambdaLR
 
 
 class EncoderDecoder(nn.Module):
-    def __init__(self, encoder, decoder, src_embed, tgt_embed, generator):
-        super(EncoderDecoder, self).__init__()
-        self.encoder = encoder
-        self.decoder = decoder
-        self.src_embed = src_embed
-        self.tgt_embed = tgt_embed
-        self.generator = generator
+    def __init__(self, h, d_model, d_ff, dropout, N, src_vocab, tgt_vocab):
+        super().__init__()
+
+        self.encoder = Encoder(EncoderLayer(h, d_model, d_ff, dropout), N)
+        self.decoder = Decoder(DecoderLayer(h, d_model, d_ff, dropout), N)
+        self.src_embed = nn.Sequential(
+            Embeddings(d_model, src_vocab),
+            PositionalEncoding(d_model, dropout),
+        )
+        self.tgt_embed = nn.Sequential(
+            Embeddings(d_model, tgt_vocab),
+            PositionalEncoding(d_model, dropout),
+        )
+        self.generator = nn.Sequential(
+            nn.Linear(d_model, tgt_vocab),
+            nn.LogSoftmax(dim=-1)
+        )
 
         for p in self.parameters():
             if p.dim() > 1:
@@ -29,16 +38,6 @@ class EncoderDecoder(nn.Module):
 
     def decode(self, memory, src_mask, tgt, tgt_mask):
         return self.decoder(self.tgt_embed(tgt), memory, src_mask, tgt_mask)
-
-
-class Generator(nn.Module):
-    def __init__(self, d_model, vocab):
-        super(Generator, self).__init__()
-        self.proj = nn.Linear(d_model, vocab)
-
-    def forward(self, x):
-        return log_softmax(self.proj(x), dim=-1)
-
 
 def clones(module, N):
     "Produce N identical layers."
@@ -132,10 +131,13 @@ class DecoderLayer(nn.Module):
 def subsequent_mask(size):
     "Mask out subsequent positions."
     attn_shape = (1, size, size)
-    return torch.triu(
-        torch.ones(attn_shape),
-        diagonal=1,
-    ).type(torch.uint8) == 0
+    return (
+        torch.triu(
+            torch.ones(attn_shape),
+            diagonal=1,
+        ).type(torch.uint8)
+        == 0
+    )
 
 
 def attention(query, key, value, mask=None, dropout=None):
@@ -231,19 +233,6 @@ class PositionalEncoding(nn.Module):
         return self.dropout(x)
 
 
-def make_model(src_vocab, tgt_vocab, N=6, d_model=512, d_ff=2048, h=8, dropout=0.1):
-    "Helper: Construct a model from hyperparameters."
-    model = EncoderDecoder(
-        Encoder(EncoderLayer(h, d_model, d_ff, dropout), N),
-        Decoder(DecoderLayer(h, d_model, d_ff, dropout), N),
-        nn.Sequential(Embeddings(d_model, src_vocab), PositionalEncoding(d_model, dropout)),
-        nn.Sequential(Embeddings(d_model, tgt_vocab), PositionalEncoding(d_model, dropout)),
-        Generator(d_model, tgt_vocab),
-    )
-
-    return model
-
-
 class Batch:
     """Object for holding a batch of data with mask during training."""
 
@@ -297,7 +286,9 @@ def run_epoch(
         if i % 40 == 1 and mode in ("train", "train+log"):
             lr = optimizer.param_groups[0]["lr"]
             elapsed = time.time() - start
-            print(f"Loss: {loss/batch.ntokens: 6.2f} | Tokens / Sec: {tokens/elapsed: 7.1f} | Learning Rate: {lr: 6.1e}")
+            print(
+                f"Loss: {loss/batch.ntokens: 6.2f} | Tokens / Sec: {tokens/elapsed: 7.1f} | Learning Rate: {lr: 6.1e}"
+            )
             start = time.time()
             tokens = 0
         del loss
@@ -387,7 +378,16 @@ def greedy_decode(model, src, src_mask, max_len, start_symbol):
 def example_simple_model():
     V = 11
     criterion = LabelSmoothing(size=V, padding_idx=0, smoothing=0.0)
-    model = make_model(V, V, N=2)
+
+    model = EncoderDecoder(
+        h=8,
+        d_model=512,
+        d_ff=2048,
+        dropout=0.1,
+        N=2,
+        src_vocab=V,
+        tgt_vocab=V,
+    )
 
     optimizer = torch.optim.Adam(
         model.parameters(), lr=0.5, betas=(0.9, 0.98), eps=1e-9
