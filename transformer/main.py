@@ -1,88 +1,132 @@
-import copy
 import math
 import time
 
+import lightning as L
 import torch
 import torch.nn as nn
+from lightning import Trainer
 from torch.optim.lr_scheduler import LambdaLR
 
 
-class EncoderDecoder(nn.Module):
+class EncoderDecoder(L.LightningModule):
     def __init__(self, h, d_model, d_ff, dropout, N, src_vocab, tgt_vocab):
         super().__init__()
 
         self.encoder = Encoder(h, d_model, d_ff, dropout, N)
-        self.decoder = Decoder(DecoderLayer(h, d_model, d_ff, dropout), N)
+        self.decoder = Decoder(h, d_model, d_ff, dropout, N)
         self.src_embed = nn.Sequential(
-            Embeddings(d_model, src_vocab),
-            PositionalEncoding(d_model, dropout),
+            Embeddings(d_model, src_vocab), PositionalEncoding(d_model, dropout)
         )
         self.tgt_embed = nn.Sequential(
-            Embeddings(d_model, tgt_vocab),
-            PositionalEncoding(d_model, dropout),
+            Embeddings(d_model, tgt_vocab), PositionalEncoding(d_model, dropout)
         )
         self.generator = nn.Sequential(
-            nn.Linear(d_model, tgt_vocab),
-            nn.LogSoftmax(dim=-1)
+            nn.Linear(d_model, tgt_vocab), nn.LogSoftmax(dim=-1)
+        )
+        self.loss = SimpleLossCompute(
+            self.generator, LabelSmoothing(size=11, padding_idx=0, smoothing=0.0)
         )
 
         for p in self.parameters():
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
 
-    def forward(self, src, tgt, src_mask, tgt_mask):
-        return self.decode(self.encode(src, src_mask), src_mask, tgt, tgt_mask)
+#    def configure_optimizers(self):
+#        optimizer = torch.optim.Adam(
+#            self.parameters(), lr=0.5, betas=(0.9, 0.98), eps=1e-9
+#        )
+#        lr_scheduler = LambdaLR(
+#            optimizer=optimizer,
+#            lr_lambda=lambda step: 1.0
+#            * (
+#                self.src_embed[0].d_model ** (-0.5)
+#                * min(max(step, 1) ** (-0.5), max(step, 1) * 400 ** (-1.5))
+#            ),
+#        )
+#        return {"optimizer": optimizer, "lr_scheduler": lr_scheduler}
 
-    def encode(self, src, src_mask):
-        return self.encoder(self.src_embed(src), src_mask)
+    def forward(self, batch):
+        src, tgt, src_mask, tgt_mask = (
+            batch.src,
+            batch.tgt,
+            batch.src_mask,
+            batch.tgt_mask,
+        )
 
-    def decode(self, memory, src_mask, tgt, tgt_mask):
-        return self.decoder(self.tgt_embed(tgt), memory, src_mask, tgt_mask)
+        src_embedding = self.src_embed(src)
+        tgt_embedding = self.tgt_embed(tgt)
 
-def clones(module, N):
-    "Produce N identical layers."
-    return nn.ModuleList([copy.deepcopy(module) for _ in range(N)])
+        memory = self.encoder(src_embedding, src_mask)
+        decoder_output = self.decoder(tgt_embedding, memory, src_mask, tgt_mask)
+
+        return decoder_output
+
+#    def training_step(self, batch, batch_idx):
+#        out = self.forward(batch)
+#        _, loss = self.loss(out, batch.tgt_y, batch.ntokens)
+#        return loss
+
+    def greedy_decode(self, src, src_mask, max_len, start_symbol):
+        src_embedding = self.src_embed(src)
+        memory = self.encoder(src_embedding, src_mask)
+
+        ys = torch.zeros(1, 1).fill_(start_symbol).type_as(src.data)
+        for _ in range(max_len - 1):
+            out = self.decoder(
+                self.tgt_embed(ys),
+                memory,
+                src_mask,
+                subsequent_mask(ys.size(1)).type_as(src.data),
+            )
+            prob = self.generator(out[:, -1])
+            _, next_word = torch.max(prob, dim=1)
+            next_word = next_word.data[0]
+            ys = torch.cat(
+                [ys, torch.zeros(1, 1).type_as(src.data).fill_(next_word)], dim=1
+            )
+        return ys
 
 
 class Encoder(nn.Module):
-    "Core encoder is a stack of N layers"
-
     def __init__(self, h, d_model, d_ff, dropout, N):
         super().__init__()
 
         self.layers = nn.ModuleList(
             [EncoderLayer(h, d_model, d_ff, dropout) for _ in range(N)]
         )
-        self.norm = LayerNorm(d_model)
+        self.out_norm_gain = nn.Parameter(torch.ones(d_model))
+        self.out_norm_bias = nn.Parameter(torch.ones(d_model))
+        self.eps = 1e-6
 
     def forward(self, x, mask):
-        "Pass the input (and mask) through each layer in turn."
         for layer in self.layers:
             x = layer(x, mask)
-        return self.norm(x)
 
-
-class LayerNorm(nn.Module):
-    def __init__(self, features, eps=1e-6):
-        super().__init__()
-        self.a_2 = nn.Parameter(torch.ones(features))
-        self.b_2 = nn.Parameter(torch.zeros(features))
-        self.eps = eps
-
-    def forward(self, x):
-        mean = x.mean(-1, keepdim=True)
-        std = x.std(-1, keepdim=True)
-        return self.a_2 * (x - mean) / (std + self.eps) + self.b_2
+        return (
+            self.out_norm_gain
+            * (x - x.mean(-1, keepdim=True))
+            / (x.std(-1, keepdim=True) + self.eps)
+            + self.out_norm_bias
+        )
 
 
 class SublayerConnection(nn.Module):
     def __init__(self, size, dropout):
         super().__init__()
-        self.norm = LayerNorm(size)
+        self.norm_gain = nn.Parameter(torch.ones(size))
+        self.norm_bias = nn.Parameter(torch.ones(size))
+        self.eps = 1e-6
+
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x, sublayer):
-        return x + self.dropout(sublayer(self.norm(x)))
+        normalized_x = (
+            self.norm_gain
+            * (x - x.mean(-1, keepdim=True))
+            / (x.std(-1, keepdim=True) + self.eps)
+            + self.norm_bias
+        )
+        return x + self.dropout(sublayer(normalized_x))
 
 
 class EncoderLayer(nn.Module):
@@ -90,7 +134,9 @@ class EncoderLayer(nn.Module):
         super().__init__()
         self.self_attn = MultiHeadedAttention(h, d_model)
         self.feed_forward = PositionwiseFeedForward(d_model, d_ff, dropout)
-        self.sublayer = clones(SublayerConnection(d_model, dropout), 2)
+        self.sublayer = nn.ModuleList(
+            [SublayerConnection(d_model, dropout), SublayerConnection(d_model, dropout)]
+        )
         self.size = d_model
 
     def forward(self, x, mask):
@@ -99,17 +145,25 @@ class EncoderLayer(nn.Module):
 
 
 class Decoder(nn.Module):
-    "Generic N layer decoder with masking."
+    def __init__(self, h, d_model, d_ff, dropout, N):
+        super().__init__()
 
-    def __init__(self, layer, N):
-        super(Decoder, self).__init__()
-        self.layers = clones(layer, N)
-        self.norm = LayerNorm(layer.size)
+        self.layers = nn.ModuleList(
+            [DecoderLayer(h, d_model, d_ff, dropout) for _ in range(N)]
+        )
+        self.out_norm_gain = nn.Parameter(torch.ones(d_model))
+        self.out_norm_bias = nn.Parameter(torch.ones(d_model))
+        self.eps = 1e-6
 
     def forward(self, x, memory, src_mask, tgt_mask):
         for layer in self.layers:
             x = layer(x, memory, src_mask, tgt_mask)
-        return self.norm(x)
+        return (
+            self.out_norm_gain
+            * (x - x.mean(-1, keepdim=True))
+            / (x.std(-1, keepdim=True) + self.eps)
+            + self.out_norm_bias
+        )
 
 
 class DecoderLayer(nn.Module):
@@ -121,7 +175,13 @@ class DecoderLayer(nn.Module):
         self.self_attn = MultiHeadedAttention(h, d_model)
         self.src_attn = MultiHeadedAttention(h, d_model)
         self.feed_forward = PositionwiseFeedForward(d_model, d_ff, dropout)
-        self.sublayer = clones(SublayerConnection(d_model, dropout), 3)
+        self.sublayer = nn.ModuleList(
+            [
+                SublayerConnection(d_model, dropout),
+                SublayerConnection(d_model, dropout),
+                SublayerConnection(d_model, dropout),
+            ]
+        )
 
     def forward(self, x, memory, src_mask, tgt_mask):
         "Follow Figure 1 (right) for connections."
@@ -162,7 +222,14 @@ class MultiHeadedAttention(nn.Module):
         # We assume d_v always equals d_k
         self.d_k = d_model // h
         self.h = h
-        self.linears = clones(nn.Linear(d_model, d_model), 4)
+        self.linears = nn.ModuleList(
+            [
+                nn.Linear(d_model, d_model),
+                nn.Linear(d_model, d_model),
+                nn.Linear(d_model, d_model),
+                nn.Linear(d_model, d_model),
+            ]
+        )
         self.attn = None
         self.dropout = nn.Dropout(p=dropout)
 
@@ -255,7 +322,6 @@ class Batch:
         tgt_mask = tgt_mask & subsequent_mask(tgt.size(-1)).type_as(tgt_mask.data)
         return tgt_mask
 
-
 def run_epoch(
     data_iter,
     model,
@@ -263,16 +329,16 @@ def run_epoch(
     optimizer=None,
     scheduler=None,
     mode="train",
-    accum_iter=1,
+    accum_iter=1
 ):
-    """Train a single epoch"""
+
     start = time.time()
     total_tokens = 0
     total_loss = 0
     tokens = 0
     n_accum = 0
     for i, batch in enumerate(data_iter):
-        out = model.forward(batch.src, batch.tgt, batch.src_mask, batch.tgt_mask)
+        out = model.forward(batch)
         loss, loss_node = loss_compute(out, batch.tgt_y, batch.ntokens)
         # loss_node = loss_node / accum_iter
         if mode in ("train", "train+log"):
@@ -297,18 +363,6 @@ def run_epoch(
         del loss
         del loss_node
     return total_loss / total_tokens
-
-
-def rate(step, model_size, factor, warmup):
-    """
-    we have to default the step to 1 for LambdaLR function
-    to avoid zero raising to negative power.
-    """
-    if step == 0:
-        step = 1
-    return factor * (
-        model_size ** (-0.5) * min(step ** (-0.5), step * warmup ** (-1.5))
-    )
 
 
 class LabelSmoothing(nn.Module):
@@ -362,22 +416,6 @@ class SimpleLossCompute:
         return sloss.data * norm, sloss
 
 
-def greedy_decode(model, src, src_mask, max_len, start_symbol):
-    memory = model.encode(src, src_mask)
-    ys = torch.zeros(1, 1).fill_(start_symbol).type_as(src.data)
-    for _ in range(max_len - 1):
-        out = model.decode(
-            memory, src_mask, ys, subsequent_mask(ys.size(1)).type_as(src.data)
-        )
-        prob = model.generator(out[:, -1])
-        _, next_word = torch.max(prob, dim=1)
-        next_word = next_word.data[0]
-        ys = torch.cat(
-            [ys, torch.zeros(1, 1).type_as(src.data).fill_(next_word)], dim=1
-        )
-    return ys
-
-
 def example_simple_model():
     V = 11
     criterion = LabelSmoothing(size=V, padding_idx=0, smoothing=0.0)
@@ -394,25 +432,33 @@ def example_simple_model():
         tgt_vocab=V,
     )
 
+    batch_size = 80
+#    trainer = Trainer(
+#        max_epochs=1,
+#        devices=1,
+#        accelerator="cpu"
+#    )
+#    trainer.fit(model, data_gen(V, batch_size, 20))
+
     optimizer = torch.optim.Adam(
         model.parameters(), lr=0.5, betas=(0.9, 0.98), eps=1e-9
     )
-    lr_scheduler = LambdaLR(
+    scheduler = LambdaLR(
         optimizer=optimizer,
-        lr_lambda=lambda step: rate(
-            step, model_size=model.src_embed[0].d_model, factor=1.0, warmup=400
+        lr_lambda=lambda step: 1.0
+        * (
+            model.src_embed[0].d_model ** (-0.5)
+            * min(max(step, 1) ** (-0.5), max(step, 1) * 400 ** (-1.5))
         ),
     )
-
-    batch_size = 80
     for _ in range(20):
         model.train()
         run_epoch(
             data_gen(V, batch_size, 20),
             model,
             SimpleLossCompute(model.generator, criterion),
-            optimizer,
-            lr_scheduler,
+            optimizer=optimizer,
+            scheduler=scheduler,
             mode="train",
         )
         model.eval()
@@ -427,7 +473,7 @@ def example_simple_model():
     src = torch.LongTensor([[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]])
     max_len = src.shape[1]
     src_mask = torch.ones(1, 1, max_len)
-    print(greedy_decode(model, src, src_mask, max_len=max_len, start_symbol=0))
+    print(model.greedy_decode(src, src_mask, max_len=max_len, start_symbol=0))
 
 
 example_simple_model()
