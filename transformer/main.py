@@ -1,5 +1,4 @@
 import math
-import time
 
 import lightning as L
 import torch
@@ -25,7 +24,12 @@ class CopyDataset(Dataset):
         tgt_y = self.data[idx][1:]
         tgt_mask = (tgt != self.pad).unsqueeze(-2)
 
-        subsequent_mask = torch.triu( torch.ones((1, tgt.size(-1), tgt.size(-1))), diagonal=1).type(torch.uint8) == 0
+        subsequent_mask = (
+            torch.triu(torch.ones((1, tgt.size(-1), tgt.size(-1))), diagonal=1).type(
+                torch.uint8
+            )
+            == 0
+        )
         tgt_mask = tgt_mask & subsequent_mask.type_as(tgt_mask.data)[0]
         ntokens = (tgt_y != self.pad).data.sum()
 
@@ -36,15 +40,24 @@ class EncoderDecoder(L.LightningModule):
     def __init__(self, h, d_model, d_ff, dropout, N, src_vocab, tgt_vocab):
         super().__init__()
 
+        self.eps = 1e-6
+
         self.d_model = d_model
+        self.dropout = nn.Dropout(p=dropout)
 
-        self.encoder = Encoder(h, d_model, d_ff, dropout, N)
-        self.decoder = Decoder(h, d_model, d_ff, dropout, N)
+        self.encoder_block_1 = EncoderLayer(h, d_model, d_ff, dropout)
+        self.encoder_block_2 = EncoderLayer(h, d_model, d_ff, dropout)
+        self.encoder_out_norm_gain = nn.Parameter(torch.ones(d_model))
+        self.encoder_out_norm_bias = nn.Parameter(torch.ones(d_model))
 
-        self.src_embed = Embeddings(d_model, src_vocab)
-        self.src_pos_enc = PositionalEncoding(d_model, dropout)
-        self.tgt_embed = Embeddings(d_model, tgt_vocab)
-        self.tgt_pos_enc = PositionalEncoding(d_model, dropout)
+        self.decoder_block_1 = DecoderLayer(h, d_model, d_ff, dropout)
+        self.decoder_block_2 = DecoderLayer(h, d_model, d_ff, dropout)
+        self.decoder_out_norm_gain = nn.Parameter(torch.ones(d_model))
+        self.decoder_out_norm_bias = nn.Parameter(torch.ones(d_model))
+        #        self.decoder = Decoder(h, d_model, d_ff, dropout, N)
+
+        self.src_embed = nn.Embedding(src_vocab, d_model)
+        self.tgt_embed = nn.Embedding(tgt_vocab, d_model)
 
         self.generator = nn.Sequential(
             nn.Linear(d_model, tgt_vocab), nn.LogSoftmax(dim=-1)
@@ -52,9 +65,32 @@ class EncoderDecoder(L.LightningModule):
 
         self.criterion = LabelSmoothing(size=11, padding_idx=0, smoothing=0.0)
 
+        self._init_weights()
+        self._init_positional_encodings()
+
+    def _init_weights(self):
         for p in self.parameters():
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
+
+    def _init_positional_encodings(self, max_len=5000):
+        pe = torch.zeros(max_len, self.d_model)
+        position = torch.arange(0, max_len).unsqueeze(1)
+        div_term = torch.exp(
+            torch.arange(0, self.d_model, 2) * -(math.log(10000.0) / self.d_model)
+        )
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+
+        src_pe = pe.unsqueeze(0).requires_grad_(False)
+        self.register_buffer("src_pe", src_pe)
+
+        tgt_pe = pe.unsqueeze(0).requires_grad_(False)
+        self.register_buffer("tgt_pe", tgt_pe)
+
+    def pe(self, x, mode):
+        pe = self.src_pe if mode == "src" else self.tgt_pe
+        return self.dropout(x + pe[:, : x.size(1)])
 
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(
@@ -73,13 +109,29 @@ class EncoderDecoder(L.LightningModule):
     def forward(self, batch):
         src, tgt, src_mask, tgt_mask = batch
 
-        src_embedding = self.src_embed(src)
-        src_embedding = self.src_pos_enc(src_embedding)
-        tgt_embedding = self.tgt_embed(tgt)
-        tgt_embedding = self.tgt_pos_enc(tgt_embedding)
+        src_embedding = self.src_embed(src) * math.sqrt(self.d_model)
+        src_embedding = self.pe(src_embedding, mode="src")
+        tgt_embedding = self.tgt_embed(tgt) * math.sqrt(self.d_model)
+        tgt_embedding = self.pe(tgt_embedding, mode="tgt")
 
-        memory = self.encoder(src_embedding, src_mask)
-        decoder_output = self.decoder(tgt_embedding, memory, src_mask, tgt_mask)
+        e_x = self.encoder_block_1(src_embedding, src_mask)
+        e_x = self.encoder_block_2(e_x, src_mask)
+
+        memory = (
+            self.encoder_out_norm_gain
+            * (e_x - e_x.mean(-1, keepdim=True))
+            / (e_x.std(-1, keepdim=True) + self.eps)
+            + self.encoder_out_norm_bias
+        )
+
+        d_x = self.decoder_block_1(tgt_embedding, memory, src_mask, tgt_mask)
+        d_x = self.decoder_block_2(d_x, memory, src_mask, tgt_mask)
+        decoder_output = (
+            self.decoder_out_norm_gain
+            * (d_x - d_x.mean(-1, keepdim=True))
+            / (d_x.std(-1, keepdim=True) + self.eps)
+            + self.decoder_out_norm_bias
+        )
 
         return decoder_output
 
@@ -101,50 +153,21 @@ class EncoderDecoder(L.LightningModule):
         return loss
 
     def greedy_decode(self, src, src_mask, max_len, start_symbol):
-        src_embedding = self.src_embed(src)
-        src_embedding = self.src_pos_enc(src_embedding)
-
-        memory = self.encoder(src_embedding, src_mask)
-
-        ys = torch.zeros(1, 1).fill_(start_symbol).type_as(src.data)
+        tgt = torch.zeros(1, 1).fill_(start_symbol).type_as(src.data)
         for _ in range(max_len - 1):
-            subsequent_mask = torch.triu( torch.ones((1, ys.size(1), ys.size(1))), diagonal=1).type(torch.uint8) == 0
-            out = self.decoder(
-                self.tgt_pos_enc(self.tgt_embed(ys)),
-                memory,
-                src_mask,
-                subsequent_mask.type_as(src.data),
-            )
+            tgt_mask = (
+                torch.triu(torch.ones((1, tgt.size(1), tgt.size(1))), diagonal=1).type(
+                    torch.uint8
+                )
+                == 0
+            ).type_as(src.data)
+            out = self.forward((src, tgt, src_mask, tgt_mask))
             prob = self.generator(out[:, -1])
-            _, next_word = torch.max(prob, dim=1)
-            next_word = next_word.data[0]
-            ys = torch.cat(
-                [ys, torch.zeros(1, 1).type_as(src.data).fill_(next_word)], dim=1
+            next_word = torch.argmax(prob, dim=1).item()
+            tgt = torch.cat(
+                [tgt, torch.zeros(1, 1).type_as(src.data).fill_(next_word)], dim=1
             )
-        return ys
-
-
-class Encoder(nn.Module):
-    def __init__(self, h, d_model, d_ff, dropout, N):
-        super().__init__()
-
-        self.layers = nn.ModuleList(
-            [EncoderLayer(h, d_model, d_ff, dropout) for _ in range(N)]
-        )
-        self.out_norm_gain = nn.Parameter(torch.ones(d_model))
-        self.out_norm_bias = nn.Parameter(torch.ones(d_model))
-        self.eps = 1e-6
-
-    def forward(self, x, mask):
-        for layer in self.layers:
-            x = layer(x, mask)
-
-        return (
-            self.out_norm_gain
-            * (x - x.mean(-1, keepdim=True))
-            / (x.std(-1, keepdim=True) + self.eps)
-            + self.out_norm_bias
-        )
+        return tgt
 
 
 class SublayerConnection(nn.Module):
@@ -181,28 +204,6 @@ class EncoderLayer(nn.Module):
         return self.sublayer[1](x, self.feed_forward)
 
 
-class Decoder(nn.Module):
-    def __init__(self, h, d_model, d_ff, dropout, N):
-        super().__init__()
-
-        self.layers = nn.ModuleList(
-            [DecoderLayer(h, d_model, d_ff, dropout) for _ in range(N)]
-        )
-        self.out_norm_gain = nn.Parameter(torch.ones(d_model))
-        self.out_norm_bias = nn.Parameter(torch.ones(d_model))
-        self.eps = 1e-6
-
-    def forward(self, x, memory, src_mask, tgt_mask):
-        for layer in self.layers:
-            x = layer(x, memory, src_mask, tgt_mask)
-        return (
-            self.out_norm_gain
-            * (x - x.mean(-1, keepdim=True))
-            / (x.std(-1, keepdim=True) + self.eps)
-            + self.out_norm_bias
-        )
-
-
 class DecoderLayer(nn.Module):
     "Decoder is made of self-attn, src-attn, and feed forward (defined below)"
 
@@ -228,17 +229,6 @@ class DecoderLayer(nn.Module):
         return self.sublayer[2](x, self.feed_forward)
 
 
-def attention(query, key, value, mask=None, dropout=None):
-    d_k = query.size(-1)
-    scores = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(d_k)
-    if mask is not None:
-        scores = scores.masked_fill(mask == 0, -1e9)
-    p_attn = scores.softmax(dim=-1)
-    if dropout is not None:
-        p_attn = dropout(p_attn)
-    return torch.matmul(p_attn, value), p_attn
-
-
 class MultiHeadedAttention(nn.Module):
     def __init__(self, h, d_model, dropout=0.1):
         "Take in model size and number of heads."
@@ -259,7 +249,6 @@ class MultiHeadedAttention(nn.Module):
         self.dropout = nn.Dropout(p=dropout)
 
     def forward(self, query, key, value, mask=None):
-        "Implements Figure 2"
         if mask is not None:
             # Same mask applied to all h heads.
             mask = mask.unsqueeze(1)
@@ -272,7 +261,12 @@ class MultiHeadedAttention(nn.Module):
         ]
 
         # 2) Apply attention on all the projected vectors in batch.
-        x, self.attn = attention(query, key, value, mask=mask, dropout=self.dropout)
+        scores = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(self.d_k)
+        if mask is not None:
+            scores = scores.masked_fill(mask == 0, -1e9)
+        p_attn = scores.softmax(dim=-1)
+        p_attn = self.dropout(p_attn)
+        x = torch.matmul(p_attn, value)
 
         # 3) "Concat" using a view and apply a final linear.
         x = x.transpose(1, 2).contiguous().view(nbatches, -1, self.h * self.d_k)
@@ -293,39 +287,6 @@ class PositionwiseFeedForward(nn.Module):
 
     def forward(self, x):
         return self.w_2(self.dropout(self.w_1(x).relu()))
-
-
-class Embeddings(nn.Module):
-    def __init__(self, d_model, vocab):
-        super().__init__()
-        self.lut = nn.Embedding(vocab, d_model)
-        self.d_model = d_model
-
-    def forward(self, x):
-        return self.lut(x) * math.sqrt(self.d_model)
-
-
-class PositionalEncoding(nn.Module):
-    "Implement the PE function."
-
-    def __init__(self, d_model, dropout, max_len=5000):
-        super(PositionalEncoding, self).__init__()
-        self.dropout = nn.Dropout(p=dropout)
-
-        # Compute the positional encodings once in log space.
-        pe = torch.zeros(max_len, d_model)
-        position = torch.arange(0, max_len).unsqueeze(1)
-        div_term = torch.exp(
-            torch.arange(0, d_model, 2) * -(math.log(10000.0) / d_model)
-        )
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        pe = pe.unsqueeze(0)
-        self.register_buffer("pe", pe)
-
-    def forward(self, x):
-        x = x + self.pe[:, : x.size(1)].requires_grad_(False)
-        return self.dropout(x)
 
 
 class LabelSmoothing(nn.Module):
@@ -367,7 +328,9 @@ def main():
     )
 
     dataset = CopyDataset(V, num_items=40000)
-    dataloader = DataLoader(dataset, batch_size=80, shuffle=True, num_workers=11, persistent_workers=True)
+    dataloader = DataLoader(
+        dataset, batch_size=80, shuffle=True, num_workers=11, persistent_workers=True
+    )
     iter(dataloader)
 
     tb_logger = pl_loggers.TensorBoardLogger(save_dir="logs/")
