@@ -54,7 +54,6 @@ class EncoderDecoder(L.LightningModule):
         self.decoder_block_2 = DecoderLayer(h, d_model, d_ff, dropout)
         self.decoder_out_norm_gain = nn.Parameter(torch.ones(d_model))
         self.decoder_out_norm_bias = nn.Parameter(torch.zeros(d_model))
-        #        self.decoder = Decoder(h, d_model, d_ff, dropout, N)
 
         self.src_embed = nn.Embedding(src_vocab, d_model)
         self.tgt_embed = nn.Embedding(tgt_vocab, d_model)
@@ -174,7 +173,9 @@ class EncoderLayer(nn.Module):
     def __init__(self, h, d_model, d_ff, dropout):
         super().__init__()
         self.self_attn = MultiHeadedAttention(h, d_model)
-        self.feed_forward = PositionwiseFeedForward(d_model, d_ff, dropout)
+        self.ff_w_1 = nn.Linear(d_model, d_ff)
+        self.ff_w_2 = nn.Linear(d_ff, d_model)
+
         self.layer_norm_gain_1 = nn.Parameter(torch.ones(d_model))
         self.layer_norm_gain_2 = nn.Parameter(torch.ones(d_model))
         self.layer_norm_bias_1 = nn.Parameter(torch.zeros(d_model))
@@ -187,10 +188,10 @@ class EncoderLayer(nn.Module):
         return (x - x.mean(-1, keepdim=True)) / (x.std(-1, keepdim=True) + self.eps)
 
     def forward(self, x, mask):
-        normalized_x = self.layer_norm_gain_1 * self.normalize(x) + self.layer_norm_bias_1
-        x = x + self.dropout(self.self_attn(normalized_x, normalized_x, normalized_x, mask))
-        normalized_x = self.layer_norm_gain_2 * self.normalize(x) + self.layer_norm_bias_2
-        x = x + self.dropout(self.feed_forward(x))
+        layer_norm_1_x = self.layer_norm_gain_1 * self.normalize(x) + self.layer_norm_bias_1
+        x = x + self.dropout(self.self_attn(layer_norm_1_x, layer_norm_1_x, layer_norm_1_x, mask))
+        layer_norm_2_x = self.layer_norm_gain_2 * self.normalize(x) + self.layer_norm_bias_2
+        x = x + self.dropout(self.ff_w_2(self.dropout(self.ff_w_1(layer_norm_2_x).relu())))
 
         return x
 
@@ -202,7 +203,8 @@ class DecoderLayer(nn.Module):
         super().__init__()
         self.self_attn = MultiHeadedAttention(h, d_model)
         self.src_attn = MultiHeadedAttention(h, d_model)
-        self.feed_forward = PositionwiseFeedForward(d_model, d_ff, dropout)
+        self.ff_w_1 = nn.Linear(d_model, d_ff)
+        self.ff_w_2 = nn.Linear(d_ff, d_model)
 
         self.layer_norm_gain_1 = nn.Parameter(torch.ones(d_model))
         self.layer_norm_gain_2 = nn.Parameter(torch.ones(d_model))
@@ -228,7 +230,7 @@ class DecoderLayer(nn.Module):
         x = x + self.dropout(self.src_attn(layer_norm_2_x, m, m, src_mask))
 
         layer_norm_3_x = self.layer_norm_gain_3 * self.normalize(x) + self.layer_norm_bias_3
-        x = x + self.dropout(self.feed_forward(layer_norm_3_x))
+        x = x + self.dropout(self.ff_w_2(self.dropout(self.ff_w_1(layer_norm_3_x).relu())))
 
         return x
 
@@ -278,19 +280,6 @@ class MultiHeadedAttention(nn.Module):
         del key
         del value
         return self.linears[-1](x)
-
-
-class PositionwiseFeedForward(nn.Module):
-    "Implements FFN equation."
-
-    def __init__(self, d_model, d_ff, dropout=0.1):
-        super(PositionwiseFeedForward, self).__init__()
-        self.w_1 = nn.Linear(d_model, d_ff)
-        self.w_2 = nn.Linear(d_ff, d_model)
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, x):
-        return self.w_2(self.dropout(self.w_1(x).relu()))
 
 
 class LabelSmoothing(nn.Module):
