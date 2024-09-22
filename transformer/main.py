@@ -45,13 +45,13 @@ class EncoderDecoder(L.LightningModule):
         self.d_model = d_model
         self.dropout = nn.Dropout(p=dropout)
 
-        self.encoder_block_1 = EncoderLayer(h, d_model, d_ff, dropout)
-        self.encoder_block_2 = EncoderLayer(h, d_model, d_ff, dropout)
+        self.encoder_block_1 = EncoderBlock(h, d_model, d_ff, dropout)
+        self.encoder_block_2 = EncoderBlock(h, d_model, d_ff, dropout)
         self.encoder_out_norm_gain = nn.Parameter(torch.ones(d_model))
         self.encoder_out_norm_bias = nn.Parameter(torch.zeros(d_model))
 
-        self.decoder_block_1 = DecoderLayer(h, d_model, d_ff, dropout)
-        self.decoder_block_2 = DecoderLayer(h, d_model, d_ff, dropout)
+        self.decoder_block_1 = DecoderBlock(h, d_model, d_ff, dropout)
+        self.decoder_block_2 = DecoderBlock(h, d_model, d_ff, dropout)
         self.decoder_out_norm_gain = nn.Parameter(torch.ones(d_model))
         self.decoder_out_norm_bias = nn.Parameter(torch.zeros(d_model))
 
@@ -62,7 +62,6 @@ class EncoderDecoder(L.LightningModule):
             nn.Linear(d_model, tgt_vocab), nn.LogSoftmax(dim=-1)
         )
 
-#        self.criterion = LabelSmoothing(size=11, padding_idx=0, smoothing=0.0)
         self.criterion = nn.KLDivLoss(reduction="sum")
 
         self._init_weights()
@@ -183,7 +182,7 @@ class EncoderDecoder(L.LightningModule):
         return tgt
 
 
-class EncoderLayer(nn.Module):
+class EncoderBlock(nn.Module):
     def __init__(self, h, d_model, d_ff, dropout):
         super().__init__()
         self.self_attn = MultiHeadedAttention(h, d_model)
@@ -210,8 +209,7 @@ class EncoderLayer(nn.Module):
         return x
 
 
-class DecoderLayer(nn.Module):
-    "Decoder is made of self-attn, src-attn, and feed forward (defined below)"
+class DecoderBlock(nn.Module):
 
     def __init__(self, h, d_model, d_ff, dropout):
         super().__init__()
@@ -254,31 +252,25 @@ class MultiHeadedAttention(nn.Module):
         "Take in model size and number of heads."
         super(MultiHeadedAttention, self).__init__()
         assert d_model % h == 0
-        # We assume d_v always equals d_k
         self.d_k = d_model // h
         self.h = h
-        self.linears = nn.ModuleList(
-            [
-                nn.Linear(d_model, d_model),
-                nn.Linear(d_model, d_model),
-                nn.Linear(d_model, d_model),
-                nn.Linear(d_model, d_model),
-            ]
-        )
-        self.attn = None
+
+        self.query_linear = nn.Linear(d_model, d_model)
+        self.key_linear = nn.Linear(d_model, d_model)
+        self.value_linear = nn.Linear(d_model, d_model)
+        self.out_linear = nn.Linear(d_model, d_model)
+
         self.dropout = nn.Dropout(p=dropout)
 
     def forward(self, query, key, value, mask=None):
         if mask is not None:
-            # Same mask applied to all h heads.
             mask = mask.unsqueeze(1)
         nbatches = query.size(0)
 
         # 1) Do all the linear projections in batch from d_model => h x d_k
-        query, key, value = [
-            lin(x).view(nbatches, -1, self.h, self.d_k).transpose(1, 2)
-            for lin, x in zip(self.linears, (query, key, value))
-        ]
+        query = self.query_linear(query).view(nbatches, -1, self.h, self.d_k).transpose(1,2)
+        key = self.key_linear(key).view(nbatches, -1, self.h, self.d_k).transpose(1,2)
+        value = self.value_linear(value).view(nbatches, -1, self.h, self.d_k).transpose(1,2)
 
         # 2) Apply attention on all the projected vectors in batch.
         scores = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(self.d_k)
@@ -290,10 +282,7 @@ class MultiHeadedAttention(nn.Module):
 
         # 3) "Concat" using a view and apply a final linear.
         x = x.transpose(1, 2).contiguous().view(nbatches, -1, self.h * self.d_k)
-        del query
-        del key
-        del value
-        return self.linears[-1](x)
+        return self.out_linear(x)
 
 
 def main():
