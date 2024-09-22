@@ -45,9 +45,8 @@ class EncoderDecoder(L.LightningModule):
         self.generator = nn.Sequential(
             nn.Linear(d_model, tgt_vocab), nn.LogSoftmax(dim=-1)
         )
-        self.loss = SimpleLossCompute(
-            self.generator, LabelSmoothing(size=11, padding_idx=0, smoothing=0.0)
-        )
+
+        self.criterion = LabelSmoothing(size=11, padding_idx=0, smoothing=0.0)
 
         for p in self.parameters():
             if p.dim() > 1:
@@ -78,10 +77,15 @@ class EncoderDecoder(L.LightningModule):
 
         return decoder_output
 
+    def loss(self, x, y, norm):
+
+        x = self.generator(x)
+        return self.criterion(x.contiguous().view(-1, x.size(-1)), y.contiguous().view(-1)) / norm
+
     def training_step(self, batch, batch_idx):
         src, tgt, src_mask, tgt_mask, tgt_y, ntokens = batch
         out = self.forward((src, tgt, src_mask, tgt_mask))
-        _, loss = self.loss(out, tgt_y, ntokens.sum())
+        loss = self.loss(out, tgt_y, ntokens.sum())
 
         self.lr_schedulers().step()
         self.log("train_loss", loss)
@@ -402,11 +406,7 @@ class SimpleLossCompute:
 
     def __call__(self, x, y, norm):
         x = self.generator(x)
-        sloss = (
-            self.criterion(x.contiguous().view(-1, x.size(-1)), y.contiguous().view(-1))
-            / norm
-        )
-        return sloss.data * norm, sloss
+        return self.criterion(x.contiguous().view(-1, x.size(-1)), y.contiguous().view(-1)) / norm
 
 
 def example_simple_model():
