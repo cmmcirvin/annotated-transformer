@@ -62,7 +62,8 @@ class EncoderDecoder(L.LightningModule):
             nn.Linear(d_model, tgt_vocab), nn.LogSoftmax(dim=-1)
         )
 
-        self.criterion = LabelSmoothing(size=11, padding_idx=0, smoothing=0.0)
+#        self.criterion = LabelSmoothing(size=11, padding_idx=0, smoothing=0.0)
+        self.criterion = nn.KLDivLoss(reduction="sum")
 
         self._init_weights()
         self._init_positional_encodings()
@@ -136,10 +137,23 @@ class EncoderDecoder(L.LightningModule):
 
     def loss(self, x, y, norm):
         x = self.generator(x)
-        return (
-            self.criterion(x.contiguous().view(-1, x.size(-1)), y.contiguous().view(-1))
-            / norm
-        )
+        x = x.contiguous().view(-1, x.size(-1))
+        y = y.contiguous().view(-1)
+        size = 11
+        padding_idx = 0
+        smoothing = 0.0
+        confidence = 1 - smoothing
+
+        assert x.size(1) == size
+        true_dist = x.data.clone()
+        true_dist.fill_(smoothing / (size - 2))
+        true_dist.scatter_(1, y.data.unsqueeze(1), confidence)
+        true_dist[:, padding_idx] = 0
+        mask = torch.nonzero(y.data == padding_idx)
+        if mask.dim() > 0:
+            true_dist.index_fill_(0, mask.squeeze(), 0.0)
+
+        return self.criterion(x, true_dist.clone().detach()) / norm
 
     def training_step(self, batch, batch_idx):
         src, tgt, src_mask, tgt_mask, tgt_y, ntokens = batch
@@ -280,31 +294,6 @@ class MultiHeadedAttention(nn.Module):
         del key
         del value
         return self.linears[-1](x)
-
-
-class LabelSmoothing(nn.Module):
-    "Implement label smoothing."
-
-    def __init__(self, size, padding_idx, smoothing=0.0):
-        super(LabelSmoothing, self).__init__()
-        self.criterion = nn.KLDivLoss(reduction="sum")
-        self.padding_idx = padding_idx
-        self.confidence = 1.0 - smoothing
-        self.smoothing = smoothing
-        self.size = size
-        self.true_dist = None
-
-    def forward(self, x, target):
-        assert x.size(1) == self.size
-        true_dist = x.data.clone()
-        true_dist.fill_(self.smoothing / (self.size - 2))
-        true_dist.scatter_(1, target.data.unsqueeze(1), self.confidence)
-        true_dist[:, self.padding_idx] = 0
-        mask = torch.nonzero(target.data == self.padding_idx)
-        if mask.dim() > 0:
-            true_dist.index_fill_(0, mask.squeeze(), 0.0)
-        self.true_dist = true_dist
-        return self.criterion(x, true_dist.clone().detach())
 
 
 def main():
