@@ -170,46 +170,29 @@ class EncoderDecoder(L.LightningModule):
         return tgt
 
 
-class SublayerConnection(nn.Module):
-    def __init__(self, size, dropout):
-        super().__init__()
-        self.norm_gain = nn.Parameter(torch.ones(size))
-        self.norm_bias = nn.Parameter(torch.zeros(size))
-        self.eps = 1e-6
-
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, x, sublayer):
-        normalized_x = (
-            self.norm_gain
-            * (x - x.mean(-1, keepdim=True))
-            / (x.std(-1, keepdim=True) + self.eps)
-            + self.norm_bias
-        )
-        return x + self.dropout(sublayer(normalized_x))
-
-
 class EncoderLayer(nn.Module):
     def __init__(self, h, d_model, d_ff, dropout):
         super().__init__()
         self.self_attn = MultiHeadedAttention(h, d_model)
         self.feed_forward = PositionwiseFeedForward(d_model, d_ff, dropout)
-#        self.norm_gain_1 = nn.Parameter(torch.ones(d_model))
-#        self.norm_gain_2 = nn.Parameter(torch.ones(d_model))
-#        self.norm_bias_1 = nn.Parameter(torch.zeros(d_model))
-#        self.norm_bias_2 = nn.Parameter(torch.zeros(d_model))
+        self.layer_norm_gain_1 = nn.Parameter(torch.ones(d_model))
+        self.layer_norm_gain_2 = nn.Parameter(torch.ones(d_model))
+        self.layer_norm_bias_1 = nn.Parameter(torch.zeros(d_model))
+        self.layer_norm_bias_2 = nn.Parameter(torch.zeros(d_model))
 
-        self.sublayer = nn.ModuleList(
-            [
-                SublayerConnection(d_model, dropout),
-                SublayerConnection(d_model, dropout),
-            ]
-        )
-        self.size = d_model
+        self.dropout = nn.Dropout(p=dropout)
+        self.eps = 1e-6
+
+    def normalize(self, x):
+        return (x - x.mean(-1, keepdim=True)) / (x.std(-1, keepdim=True) + self.eps)
 
     def forward(self, x, mask):
-        x = self.sublayer[0](x, lambda x: self.self_attn(x, x, x, mask))
-        return self.sublayer[1](x, self.feed_forward)
+        normalized_x = self.layer_norm_gain_1 * self.normalize(x) + self.layer_norm_bias_1
+        x = x + self.dropout(self.self_attn(normalized_x, normalized_x, normalized_x, mask))
+        normalized_x = self.layer_norm_gain_2 * self.normalize(x) + self.layer_norm_bias_2
+        x = x + self.dropout(self.feed_forward(x))
+
+        return x
 
 
 class DecoderLayer(nn.Module):
@@ -217,24 +200,37 @@ class DecoderLayer(nn.Module):
 
     def __init__(self, h, d_model, d_ff, dropout):
         super().__init__()
-        self.size = d_model
         self.self_attn = MultiHeadedAttention(h, d_model)
         self.src_attn = MultiHeadedAttention(h, d_model)
         self.feed_forward = PositionwiseFeedForward(d_model, d_ff, dropout)
-        self.sublayer = nn.ModuleList(
-            [
-                SublayerConnection(d_model, dropout),
-                SublayerConnection(d_model, dropout),
-                SublayerConnection(d_model, dropout),
-            ]
-        )
+
+        self.layer_norm_gain_1 = nn.Parameter(torch.ones(d_model))
+        self.layer_norm_gain_2 = nn.Parameter(torch.ones(d_model))
+        self.layer_norm_gain_3 = nn.Parameter(torch.ones(d_model))
+        self.layer_norm_bias_1 = nn.Parameter(torch.zeros(d_model))
+        self.layer_norm_bias_2 = nn.Parameter(torch.zeros(d_model))
+        self.layer_norm_bias_3 = nn.Parameter(torch.zeros(d_model))
+
+        self.dropout = nn.Dropout(p=dropout)
+        self.eps = 1e-6
+
+    def normalize(self, x):
+        return (x - x.mean(-1, keepdim=True)) / (x.std(-1, keepdim=True) + self.eps)
 
     def forward(self, x, memory, src_mask, tgt_mask):
         "Follow Figure 1 (right) for connections."
         m = memory
-        x = self.sublayer[0](x, lambda x: self.self_attn(x, x, x, tgt_mask))
-        x = self.sublayer[1](x, lambda x: self.src_attn(x, m, m, src_mask))
-        return self.sublayer[2](x, self.feed_forward)
+
+        layer_norm_1_x = self.layer_norm_gain_1 * self.normalize(x) + self.layer_norm_bias_1
+        x = x + self.dropout(self.self_attn(layer_norm_1_x, layer_norm_1_x, layer_norm_1_x, tgt_mask))
+
+        layer_norm_2_x = self.layer_norm_gain_2 * self.normalize(x) + self.layer_norm_bias_2
+        x = x + self.dropout(self.src_attn(layer_norm_2_x, m, m, src_mask))
+
+        layer_norm_3_x = self.layer_norm_gain_3 * self.normalize(x) + self.layer_norm_bias_3
+        x = x + self.dropout(self.feed_forward(layer_norm_3_x))
+
+        return x
 
 
 class MultiHeadedAttention(nn.Module):
