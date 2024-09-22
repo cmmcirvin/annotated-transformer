@@ -5,6 +5,7 @@ import lightning as L
 import torch
 import torch.nn as nn
 from lightning import Trainer
+from lightning.pytorch import loggers as pl_loggers
 from torch.optim.lr_scheduler import LambdaLR
 
 
@@ -31,19 +32,19 @@ class EncoderDecoder(L.LightningModule):
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
 
-#    def configure_optimizers(self):
-#        optimizer = torch.optim.Adam(
-#            self.parameters(), lr=0.5, betas=(0.9, 0.98), eps=1e-9
-#        )
-#        lr_scheduler = LambdaLR(
-#            optimizer=optimizer,
-#            lr_lambda=lambda step: 1.0
-#            * (
-#                self.src_embed[0].d_model ** (-0.5)
-#                * min(max(step, 1) ** (-0.5), max(step, 1) * 400 ** (-1.5))
-#            ),
-#        )
-#        return {"optimizer": optimizer, "lr_scheduler": lr_scheduler}
+    def configure_optimizers(self):
+        optimizer = torch.optim.Adam(
+            self.parameters(), lr=0.5, betas=(0.9, 0.98), eps=1e-9
+        )
+        lr_scheduler = LambdaLR(
+            optimizer=optimizer,
+            lr_lambda=lambda step: 1.0
+            * (
+                self.src_embed[0].d_model ** (-0.5)
+                * min(max(step, 1) ** (-0.5), max(step, 1) * 400 ** (-1.5))
+            ),
+        )
+        return {"optimizer": optimizer, "lr_scheduler": lr_scheduler}
 
     def forward(self, batch):
         src, tgt, src_mask, tgt_mask = (
@@ -61,10 +62,14 @@ class EncoderDecoder(L.LightningModule):
 
         return decoder_output
 
-#    def training_step(self, batch, batch_idx):
-#        out = self.forward(batch)
-#        _, loss = self.loss(out, batch.tgt_y, batch.ntokens)
-#        return loss
+    def training_step(self, batch, batch_idx):
+        out = self.forward(batch)
+        _, loss = self.loss(out, batch.tgt_y, batch.ntokens)
+
+        self.lr_schedulers().step()
+        self.log("train_loss", loss)
+        self.log("learning_rate", self.lr_schedulers()._last_lr[0])
+        return loss
 
     def greedy_decode(self, src, src_mask, max_len, start_symbol):
         src_embedding = self.src_embed(src)
@@ -432,42 +437,44 @@ def example_simple_model():
         tgt_vocab=V,
     )
 
+    tb_logger = pl_loggers.TensorBoardLogger(save_dir="logs/")
     batch_size = 80
-#    trainer = Trainer(
-#        max_epochs=1,
-#        devices=1,
-#        accelerator="cpu"
-#    )
-#    trainer.fit(model, data_gen(V, batch_size, 20))
+    trainer = Trainer(
+        max_epochs=1,
+        devices=1,
+        accelerator="cpu",
+        logger=tb_logger
+    )
+    trainer.fit(model, data_gen(V, batch_size, 400))
 
-    optimizer = torch.optim.Adam(
-        model.parameters(), lr=0.5, betas=(0.9, 0.98), eps=1e-9
-    )
-    scheduler = LambdaLR(
-        optimizer=optimizer,
-        lr_lambda=lambda step: 1.0
-        * (
-            model.src_embed[0].d_model ** (-0.5)
-            * min(max(step, 1) ** (-0.5), max(step, 1) * 400 ** (-1.5))
-        ),
-    )
-    for _ in range(20):
-        model.train()
-        run_epoch(
-            data_gen(V, batch_size, 20),
-            model,
-            SimpleLossCompute(model.generator, criterion),
-            optimizer=optimizer,
-            scheduler=scheduler,
-            mode="train",
-        )
-        model.eval()
-        run_epoch(
-            data_gen(V, batch_size, 5),
-            model,
-            SimpleLossCompute(model.generator, criterion),
-            mode="eval",
-        )
+#    optimizer = torch.optim.Adam(
+#        model.parameters(), lr=0.5, betas=(0.9, 0.98), eps=1e-9
+#    )
+#    scheduler = LambdaLR(
+#        optimizer=optimizer,
+#        lr_lambda=lambda step: 1.0
+#        * (
+#            model.src_embed[0].d_model ** (-0.5)
+#            * min(max(step, 1) ** (-0.5), max(step, 1) * 400 ** (-1.5))
+#        ),
+#    )
+#    for _ in range(20):
+#        model.train()
+#        run_epoch(
+#            data_gen(V, batch_size, 20),
+#            model,
+#            SimpleLossCompute(model.generator, criterion),
+#            optimizer=optimizer,
+#            scheduler=scheduler,
+#            mode="train",
+#        )
+#        model.eval()
+#        run_epoch(
+#            data_gen(V, batch_size, 5),
+#            model,
+#            SimpleLossCompute(model.generator, criterion),
+#            mode="eval",
+#        )
 
     model.eval()
     src = torch.LongTensor([[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]])
