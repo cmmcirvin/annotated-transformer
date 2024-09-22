@@ -7,7 +7,28 @@ import torch.nn as nn
 from lightning import Trainer
 from lightning.pytorch import loggers as pl_loggers
 from torch.optim.lr_scheduler import LambdaLR
+from torch.utils.data import Dataset, DataLoader
 
+class CopyDataset(Dataset):
+    def __init__(self, V=11, num_items=400):
+
+        self.data = torch.randint(1, V, size=(num_items, 10))
+        self.data[:, 0] = 1
+        self.pad = 0
+
+    def __len__(self):
+        return self.data.shape[0]
+
+    def __getitem__(self, idx):
+        src = self.data[idx]
+        src_mask = (src != self.pad).unsqueeze(-2)
+        tgt = self.data[idx][:-1]
+        tgt_y = self.data[idx][1:]
+        tgt_mask = (tgt != self.pad).unsqueeze(-2)
+        tgt_mask = tgt_mask & subsequent_mask(tgt.size(-1)).type_as(tgt_mask.data)[0]
+        ntokens = (tgt_y != self.pad).data.sum()
+
+        return src, tgt, src_mask, tgt_mask, tgt_y, ntokens
 
 class EncoderDecoder(L.LightningModule):
     def __init__(self, h, d_model, d_ff, dropout, N, src_vocab, tgt_vocab):
@@ -47,12 +68,7 @@ class EncoderDecoder(L.LightningModule):
         return {"optimizer": optimizer, "lr_scheduler": lr_scheduler}
 
     def forward(self, batch):
-        src, tgt, src_mask, tgt_mask = (
-            batch.src,
-            batch.tgt,
-            batch.src_mask,
-            batch.tgt_mask,
-        )
+        src, tgt, src_mask, tgt_mask = batch
 
         src_embedding = self.src_embed(src)
         tgt_embedding = self.tgt_embed(tgt)
@@ -63,8 +79,9 @@ class EncoderDecoder(L.LightningModule):
         return decoder_output
 
     def training_step(self, batch, batch_idx):
-        out = self.forward(batch)
-        _, loss = self.loss(out, batch.tgt_y, batch.ntokens)
+        src, tgt, src_mask, tgt_mask, tgt_y, ntokens = batch
+        out = self.forward((src, tgt, src_mask, tgt_mask))
+        _, loss = self.loss(out, tgt_y, ntokens.sum())
 
         self.lr_schedulers().step()
         self.log("train_loss", loss)
@@ -308,25 +325,6 @@ class PositionalEncoding(nn.Module):
         return self.dropout(x)
 
 
-class Batch:
-    """Object for holding a batch of data with mask during training."""
-
-    def __init__(self, src, tgt=None, pad=2):  # 2 = <blank>
-        self.src = src
-        self.src_mask = (src != pad).unsqueeze(-2)
-        if tgt is not None:
-            self.tgt = tgt[:, :-1]
-            self.tgt_y = tgt[:, 1:]
-            self.tgt_mask = self.make_std_mask(self.tgt, pad)
-            self.ntokens = (self.tgt_y != pad).data.sum()
-
-    @staticmethod
-    def make_std_mask(tgt, pad):
-        "Create a mask to hide padding and future words."
-        tgt_mask = (tgt != pad).unsqueeze(-2)
-        tgt_mask = tgt_mask & subsequent_mask(tgt.size(-1)).type_as(tgt_mask.data)
-        return tgt_mask
-
 def run_epoch(
     data_iter,
     model,
@@ -395,16 +393,6 @@ class LabelSmoothing(nn.Module):
         return self.criterion(x, true_dist.clone().detach())
 
 
-def data_gen(V, batch_size, nbatches):
-    "Generate random data for a src-tgt copy task."
-    for _ in range(nbatches):
-        data = torch.randint(1, V, size=(batch_size, 10))
-        data[:, 0] = 1
-        src = data.requires_grad_(False).clone().detach()
-        tgt = data.requires_grad_(False).clone().detach()
-        yield Batch(src, tgt, 0)
-
-
 class SimpleLossCompute:
     "A simple loss compute and train function."
 
@@ -434,15 +422,17 @@ def example_simple_model():
         tgt_vocab=V,
     )
 
+    dataset = CopyDataset(V, num_items=40000)
+    dataloader = DataLoader(dataset, batch_size=80, shuffle=True)
+
     tb_logger = pl_loggers.TensorBoardLogger(save_dir="logs/")
-    batch_size = 80
     trainer = Trainer(
         max_epochs=1,
         devices=1,
         accelerator="cpu",
         logger=tb_logger
     )
-    trainer.fit(model, data_gen(V, batch_size, 400))
+    trainer.fit(model, dataloader)
 
     model.eval()
     src = torch.LongTensor([[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]])
