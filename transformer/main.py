@@ -48,12 +48,12 @@ class EncoderDecoder(L.LightningModule):
         self.encoder_block_1 = EncoderLayer(h, d_model, d_ff, dropout)
         self.encoder_block_2 = EncoderLayer(h, d_model, d_ff, dropout)
         self.encoder_out_norm_gain = nn.Parameter(torch.ones(d_model))
-        self.encoder_out_norm_bias = nn.Parameter(torch.ones(d_model))
+        self.encoder_out_norm_bias = nn.Parameter(torch.zeros(d_model))
 
         self.decoder_block_1 = DecoderLayer(h, d_model, d_ff, dropout)
         self.decoder_block_2 = DecoderLayer(h, d_model, d_ff, dropout)
         self.decoder_out_norm_gain = nn.Parameter(torch.ones(d_model))
-        self.decoder_out_norm_bias = nn.Parameter(torch.ones(d_model))
+        self.decoder_out_norm_bias = nn.Parameter(torch.zeros(d_model))
         #        self.decoder = Decoder(h, d_model, d_ff, dropout, N)
 
         self.src_embed = nn.Embedding(src_vocab, d_model)
@@ -174,7 +174,7 @@ class SublayerConnection(nn.Module):
     def __init__(self, size, dropout):
         super().__init__()
         self.norm_gain = nn.Parameter(torch.ones(size))
-        self.norm_bias = nn.Parameter(torch.ones(size))
+        self.norm_bias = nn.Parameter(torch.zeros(size))
         self.eps = 1e-6
 
         self.dropout = nn.Dropout(dropout)
@@ -194,8 +194,16 @@ class EncoderLayer(nn.Module):
         super().__init__()
         self.self_attn = MultiHeadedAttention(h, d_model)
         self.feed_forward = PositionwiseFeedForward(d_model, d_ff, dropout)
+#        self.norm_gain_1 = nn.Parameter(torch.ones(d_model))
+#        self.norm_gain_2 = nn.Parameter(torch.ones(d_model))
+#        self.norm_bias_1 = nn.Parameter(torch.zeros(d_model))
+#        self.norm_bias_2 = nn.Parameter(torch.zeros(d_model))
+
         self.sublayer = nn.ModuleList(
-            [SublayerConnection(d_model, dropout), SublayerConnection(d_model, dropout)]
+            [
+                SublayerConnection(d_model, dropout),
+                SublayerConnection(d_model, dropout),
+            ]
         )
         self.size = d_model
 
