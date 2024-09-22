@@ -7,13 +7,12 @@ import torch.nn as nn
 from lightning import Trainer
 from lightning.pytorch import loggers as pl_loggers
 from torch.optim.lr_scheduler import LambdaLR
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader, Dataset
+
 
 class CopyDataset(Dataset):
     def __init__(self, V=11, num_items=400):
-
         self.data = torch.randint(1, V, size=(num_items, 10))
-        self.data[:, 0] = 1
         self.pad = 0
 
     def __len__(self):
@@ -25,23 +24,28 @@ class CopyDataset(Dataset):
         tgt = self.data[idx][:-1]
         tgt_y = self.data[idx][1:]
         tgt_mask = (tgt != self.pad).unsqueeze(-2)
-        tgt_mask = tgt_mask & subsequent_mask(tgt.size(-1)).type_as(tgt_mask.data)[0]
+
+        subsequent_mask = torch.triu( torch.ones((1, tgt.size(-1), tgt.size(-1))), diagonal=1).type(torch.uint8) == 0
+        tgt_mask = tgt_mask & subsequent_mask.type_as(tgt_mask.data)[0]
         ntokens = (tgt_y != self.pad).data.sum()
 
         return src, tgt, src_mask, tgt_mask, tgt_y, ntokens
+
 
 class EncoderDecoder(L.LightningModule):
     def __init__(self, h, d_model, d_ff, dropout, N, src_vocab, tgt_vocab):
         super().__init__()
 
+        self.d_model = d_model
+
         self.encoder = Encoder(h, d_model, d_ff, dropout, N)
         self.decoder = Decoder(h, d_model, d_ff, dropout, N)
-        self.src_embed = nn.Sequential(
-            Embeddings(d_model, src_vocab), PositionalEncoding(d_model, dropout)
-        )
-        self.tgt_embed = nn.Sequential(
-            Embeddings(d_model, tgt_vocab), PositionalEncoding(d_model, dropout)
-        )
+
+        self.src_embed = Embeddings(d_model, src_vocab)
+        self.src_pos_enc = PositionalEncoding(d_model, dropout)
+        self.tgt_embed = Embeddings(d_model, tgt_vocab)
+        self.tgt_pos_enc = PositionalEncoding(d_model, dropout)
+
         self.generator = nn.Sequential(
             nn.Linear(d_model, tgt_vocab), nn.LogSoftmax(dim=-1)
         )
@@ -60,7 +64,7 @@ class EncoderDecoder(L.LightningModule):
             optimizer=optimizer,
             lr_lambda=lambda step: 1.0
             * (
-                self.src_embed[0].d_model ** (-0.5)
+                self.d_model ** (-0.5)
                 * min(max(step, 1) ** (-0.5), max(step, 1) * 400 ** (-1.5))
             ),
         )
@@ -70,7 +74,9 @@ class EncoderDecoder(L.LightningModule):
         src, tgt, src_mask, tgt_mask = batch
 
         src_embedding = self.src_embed(src)
+        src_embedding = self.src_pos_enc(src_embedding)
         tgt_embedding = self.tgt_embed(tgt)
+        tgt_embedding = self.tgt_pos_enc(tgt_embedding)
 
         memory = self.encoder(src_embedding, src_mask)
         decoder_output = self.decoder(tgt_embedding, memory, src_mask, tgt_mask)
@@ -78,9 +84,11 @@ class EncoderDecoder(L.LightningModule):
         return decoder_output
 
     def loss(self, x, y, norm):
-
         x = self.generator(x)
-        return self.criterion(x.contiguous().view(-1, x.size(-1)), y.contiguous().view(-1)) / norm
+        return (
+            self.criterion(x.contiguous().view(-1, x.size(-1)), y.contiguous().view(-1))
+            / norm
+        )
 
     def training_step(self, batch, batch_idx):
         src, tgt, src_mask, tgt_mask, tgt_y, ntokens = batch
@@ -94,15 +102,18 @@ class EncoderDecoder(L.LightningModule):
 
     def greedy_decode(self, src, src_mask, max_len, start_symbol):
         src_embedding = self.src_embed(src)
+        src_embedding = self.src_pos_enc(src_embedding)
+
         memory = self.encoder(src_embedding, src_mask)
 
         ys = torch.zeros(1, 1).fill_(start_symbol).type_as(src.data)
         for _ in range(max_len - 1):
+            subsequent_mask = torch.triu( torch.ones((1, ys.size(1), ys.size(1))), diagonal=1).type(torch.uint8) == 0
             out = self.decoder(
-                self.tgt_embed(ys),
+                self.tgt_pos_enc(self.tgt_embed(ys)),
                 memory,
                 src_mask,
-                subsequent_mask(ys.size(1)).type_as(src.data),
+                subsequent_mask.type_as(src.data),
             )
             prob = self.generator(out[:, -1])
             _, next_word = torch.max(prob, dim=1)
@@ -217,18 +228,6 @@ class DecoderLayer(nn.Module):
         return self.sublayer[2](x, self.feed_forward)
 
 
-def subsequent_mask(size):
-    "Mask out subsequent positions."
-    attn_shape = (1, size, size)
-    return (
-        torch.triu(
-            torch.ones(attn_shape),
-            diagonal=1,
-        ).type(torch.uint8)
-        == 0
-    )
-
-
 def attention(query, key, value, mask=None, dropout=None):
     d_k = query.size(-1)
     scores = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(d_k)
@@ -329,49 +328,6 @@ class PositionalEncoding(nn.Module):
         return self.dropout(x)
 
 
-def run_epoch(
-    data_iter,
-    model,
-    loss_compute,
-    optimizer=None,
-    scheduler=None,
-    mode="train",
-    accum_iter=1
-):
-
-    start = time.time()
-    total_tokens = 0
-    total_loss = 0
-    tokens = 0
-    n_accum = 0
-    for i, batch in enumerate(data_iter):
-        out = model.forward(batch)
-        loss, loss_node = loss_compute(out, batch.tgt_y, batch.ntokens)
-        # loss_node = loss_node / accum_iter
-        if mode in ("train", "train+log"):
-            loss_node.backward()
-            if i % accum_iter == 0:
-                optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
-                n_accum += 1
-            scheduler.step()
-
-        total_loss += loss
-        total_tokens += batch.ntokens
-        tokens += batch.ntokens
-        if i % 40 == 1 and mode in ("train", "train+log"):
-            lr = optimizer.param_groups[0]["lr"]
-            elapsed = time.time() - start
-            print(
-                f"Loss: {loss/batch.ntokens: 6.2f} | Tokens / Sec: {tokens/elapsed: 7.1f} | Learning Rate: {lr: 6.1e}"
-            )
-            start = time.time()
-            tokens = 0
-        del loss
-        del loss_node
-    return total_loss / total_tokens
-
-
 class LabelSmoothing(nn.Module):
     "Implement label smoothing."
 
@@ -397,19 +353,7 @@ class LabelSmoothing(nn.Module):
         return self.criterion(x, true_dist.clone().detach())
 
 
-class SimpleLossCompute:
-    "A simple loss compute and train function."
-
-    def __init__(self, generator, criterion):
-        self.generator = generator
-        self.criterion = criterion
-
-    def __call__(self, x, y, norm):
-        x = self.generator(x)
-        return self.criterion(x.contiguous().view(-1, x.size(-1)), y.contiguous().view(-1)) / norm
-
-
-def example_simple_model():
+def main():
     V = 11
 
     model = EncoderDecoder(
@@ -423,15 +367,11 @@ def example_simple_model():
     )
 
     dataset = CopyDataset(V, num_items=40000)
-    dataloader = DataLoader(dataset, batch_size=80, shuffle=True)
+    dataloader = DataLoader(dataset, batch_size=80, shuffle=True, num_workers=11, persistent_workers=True)
+    iter(dataloader)
 
     tb_logger = pl_loggers.TensorBoardLogger(save_dir="logs/")
-    trainer = Trainer(
-        max_epochs=1,
-        devices=1,
-        accelerator="cpu",
-        logger=tb_logger
-    )
+    trainer = Trainer(max_epochs=1, devices=1, logger=tb_logger)
     trainer.fit(model, dataloader)
 
     model.eval()
@@ -441,4 +381,5 @@ def example_simple_model():
     print(model.greedy_decode(src, src_mask, max_len=max_len, start_symbol=0))
 
 
-example_simple_model()
+if __name__ == "__main__":
+    main()
