@@ -22,7 +22,6 @@ class ShakespeareDataset(Dataset):
         self.V = len(self.vocabulary)
         self.mapping = {char: idx for idx, char in enumerate(self.vocabulary)}
         self.reverse_mapping = {idx: char for idx, char in enumerate(self.vocabulary)}
-#        self.batch_idxes = torch.randint(0, len(self.data) - seq_len - 1, size=(num_batches,))
 
     def __len__(self):
         return self.num_batches
@@ -340,6 +339,7 @@ class MultiHeadedAttention(nn.Module):
 
 
 def main():
+#    dataset = CopyDataset(V, num_items=100)
     dataset = ShakespeareDataset(num_batches=100000)
 
     model = EncoderDecoder(
@@ -352,7 +352,6 @@ def main():
         tgt_vocab=dataset.V,
     )
 
-#    dataset = CopyDataset(V, num_items=100)
 
     dataloader = DataLoader(dataset, batch_size=256, shuffle=True, num_workers=11, persistent_workers=True)
     iter(dataloader)
@@ -370,9 +369,6 @@ def main():
     out = model.greedy_decode(src, src_mask, max_len=max_len, start_symbol=0)
 
     print("".join([dataset.reverse_mapping[int(idx.item())] for idx in out.squeeze()]))
-
-
-    print("hi")
 
 
 if __name__ == "__main__":
