@@ -8,6 +8,45 @@ from lightning.pytorch import loggers as pl_loggers
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader, Dataset
 
+import datasets
+
+class ShakespeareDataset(Dataset):
+
+    def __init__(self, seq_len=128, num_batches=10000):
+        self.pad = 0
+        self.seq_len = seq_len
+        self.num_batches = num_batches
+
+        self.data = datasets.load_dataset('tiny_shakespeare')['train']['text'][0]
+        self.vocabulary = sorted(set(self.data))
+        self.V = len(self.vocabulary)
+        self.mapping = {char: idx for idx, char in enumerate(self.vocabulary)}
+        self.reverse_mapping = {idx: char for idx, char in enumerate(self.vocabulary)}
+#        self.batch_idxes = torch.randint(0, len(self.data) - seq_len - 1, size=(num_batches,))
+
+    def __len__(self):
+        return self.num_batches
+
+    def __getitem__(self, idx):
+        start_idx = torch.randint(0, len(self.data) - self.seq_len - 1, (1,)).item()
+
+        # Get text from the dataset of length self.seq_len
+        text = self.data[start_idx:start_idx + self.seq_len]
+
+        # Apply character-level encoding
+        encoded_text = torch.tensor([self.mapping[char] for char in text])
+
+        src = encoded_text
+        src_mask = (src != self.pad).unsqueeze(-2)
+        tgt = encoded_text[:-1]
+        tgt_y = encoded_text[1:]
+        tgt_mask = (tgt != self.pad).unsqueeze(-2)
+
+        subsequent_mask = torch.triu(torch.ones((1, tgt.size(-1), tgt.size(-1))), diagonal=1).type( torch.uint8) == 0
+        tgt_mask = tgt_mask & subsequent_mask.type_as(tgt_mask.data)[0]
+        ntokens = (tgt_y != self.pad).data.sum()
+
+        return src, tgt, src_mask, tgt_mask, tgt_y, ntokens
 
 class CopyDataset(Dataset):
     def __init__(self, V=11, num_items=400):
@@ -45,13 +84,15 @@ class EncoderDecoder(L.LightningModule):
         self.d_model = d_model
         self.dropout = nn.Dropout(p=dropout)
 
-        self.encoder_block_1 = EncoderBlock(h, d_model, d_ff, dropout)
-        self.encoder_block_2 = EncoderBlock(h, d_model, d_ff, dropout)
+        self.encoder_blocks = nn.ModuleList([
+            EncoderBlock(h, d_model, d_ff, dropout) for _ in range(N)
+        ])
         self.encoder_out_norm_gain = nn.Parameter(torch.ones(d_model))
         self.encoder_out_norm_bias = nn.Parameter(torch.zeros(d_model))
 
-        self.decoder_block_1 = DecoderBlock(h, d_model, d_ff, dropout)
-        self.decoder_block_2 = DecoderBlock(h, d_model, d_ff, dropout)
+        self.decoder_blocks = nn.ModuleList([
+            DecoderBlock(h, d_model, d_ff, dropout) for _ in range(N)
+        ])
         self.decoder_out_norm_gain = nn.Parameter(torch.ones(d_model))
         self.decoder_out_norm_bias = nn.Parameter(torch.zeros(d_model))
 
@@ -63,6 +104,8 @@ class EncoderDecoder(L.LightningModule):
         )
 
         self.criterion = nn.KLDivLoss(reduction="sum")
+
+        self.V = tgt_vocab
 
         self._init_weights()
         self._init_positional_encodings()
@@ -113,24 +156,17 @@ class EncoderDecoder(L.LightningModule):
         tgt_embedding = self.tgt_embed(tgt) * math.sqrt(self.d_model)
         tgt_embedding = self.pe(tgt_embedding, mode="tgt")
 
-        e_x = self.encoder_block_1(src_embedding, src_mask)
-        e_x = self.encoder_block_2(e_x, src_mask)
+        e_x = src_embedding
+        for block in self.encoder_blocks:
+            e_x = block(e_x, src_mask)
 
-        memory = (
-            self.encoder_out_norm_gain
-            * (e_x - e_x.mean(-1, keepdim=True))
-            / (e_x.std(-1, keepdim=True) + self.eps)
-            + self.encoder_out_norm_bias
-        )
+        memory = self.encoder_out_norm_gain * (e_x - e_x.mean(-1, keepdim=True)) / (e_x.std(-1, keepdim=True) + self.eps) + self.encoder_out_norm_bias
 
-        d_x = self.decoder_block_1(tgt_embedding, memory, src_mask, tgt_mask)
-        d_x = self.decoder_block_2(d_x, memory, src_mask, tgt_mask)
-        decoder_output = (
-            self.decoder_out_norm_gain
-            * (d_x - d_x.mean(-1, keepdim=True))
-            / (d_x.std(-1, keepdim=True) + self.eps)
-            + self.decoder_out_norm_bias
-        )
+        d_x = tgt_embedding
+        for block in self.decoder_blocks:
+            d_x = block(d_x, memory, src_mask, tgt_mask)
+
+        decoder_output = self.decoder_out_norm_gain * (d_x - d_x.mean(-1, keepdim=True)) / (d_x.std(-1, keepdim=True) + self.eps) + self.decoder_out_norm_bias
 
         return decoder_output
 
@@ -138,7 +174,7 @@ class EncoderDecoder(L.LightningModule):
         x = self.generator(x)
         x = x.contiguous().view(-1, x.size(-1))
         y = y.contiguous().view(-1)
-        size = 11
+        size = self.V
         padding_idx = 0
         smoothing = 0.0
         confidence = 1 - smoothing
@@ -167,12 +203,7 @@ class EncoderDecoder(L.LightningModule):
     def greedy_decode(self, src, src_mask, max_len, start_symbol):
         tgt = torch.zeros(1, 1).fill_(start_symbol).type_as(src.data)
         for _ in range(max_len - 1):
-            tgt_mask = (
-                torch.triu(torch.ones((1, tgt.size(1), tgt.size(1))), diagonal=1).type(
-                    torch.uint8
-                )
-                == 0
-            ).type_as(src.data)
+            tgt_mask = (torch.triu(torch.ones((1, tgt.size(1), tgt.size(1))), diagonal=1).type( torch.uint8) == 0).type_as(src.data)
             out = self.forward((src, tgt, src_mask, tgt_mask))
             prob = self.generator(out[:, -1])
             next_word = torch.argmax(prob, dim=1).item()
@@ -201,10 +232,18 @@ class EncoderBlock(nn.Module):
         return (x - x.mean(-1, keepdim=True)) / (x.std(-1, keepdim=True) + self.eps)
 
     def forward(self, x, mask):
-        layer_norm_1_x = self.layer_norm_gain_1 * self.normalize(x) + self.layer_norm_bias_1
-        x = x + self.dropout(self.self_attn(layer_norm_1_x, layer_norm_1_x, layer_norm_1_x, mask))
-        layer_norm_2_x = self.layer_norm_gain_2 * self.normalize(x) + self.layer_norm_bias_2
-        x = x + self.dropout(self.ff_w_2(self.dropout(self.ff_w_1(layer_norm_2_x).relu())))
+        layer_norm_1_x = (
+            self.layer_norm_gain_1 * self.normalize(x) + self.layer_norm_bias_1
+        )
+        x = x + self.dropout(
+            self.self_attn(layer_norm_1_x, layer_norm_1_x, layer_norm_1_x, mask)
+        )
+        layer_norm_2_x = (
+            self.layer_norm_gain_2 * self.normalize(x) + self.layer_norm_bias_2
+        )
+        x = x + self.dropout(
+            self.ff_w_2(self.dropout(self.ff_w_1(layer_norm_2_x).relu()))
+        )
 
         return x
 
@@ -235,21 +274,30 @@ class DecoderBlock(nn.Module):
         "Follow Figure 1 (right) for connections."
         m = memory
 
-        layer_norm_1_x = self.layer_norm_gain_1 * self.normalize(x) + self.layer_norm_bias_1
-        x = x + self.dropout(self.self_attn(layer_norm_1_x, layer_norm_1_x, layer_norm_1_x, tgt_mask))
+        layer_norm_1_x = (
+            self.layer_norm_gain_1 * self.normalize(x) + self.layer_norm_bias_1
+        )
+        x = x + self.dropout(
+            self.self_attn(layer_norm_1_x, layer_norm_1_x, layer_norm_1_x, tgt_mask)
+        )
 
-        layer_norm_2_x = self.layer_norm_gain_2 * self.normalize(x) + self.layer_norm_bias_2
+        layer_norm_2_x = (
+            self.layer_norm_gain_2 * self.normalize(x) + self.layer_norm_bias_2
+        )
         x = x + self.dropout(self.src_attn(layer_norm_2_x, m, m, src_mask))
 
-        layer_norm_3_x = self.layer_norm_gain_3 * self.normalize(x) + self.layer_norm_bias_3
-        x = x + self.dropout(self.ff_w_2(self.dropout(self.ff_w_1(layer_norm_3_x).relu())))
+        layer_norm_3_x = (
+            self.layer_norm_gain_3 * self.normalize(x) + self.layer_norm_bias_3
+        )
+        x = x + self.dropout(
+            self.ff_w_2(self.dropout(self.ff_w_1(layer_norm_3_x).relu()))
+        )
 
         return x
 
 
 class MultiHeadedAttention(nn.Module):
     def __init__(self, h, d_model, dropout=0.1):
-        "Take in model size and number of heads."
         super(MultiHeadedAttention, self).__init__()
         assert d_model % h == 0
         self.d_k = d_model // h
@@ -267,12 +315,18 @@ class MultiHeadedAttention(nn.Module):
             mask = mask.unsqueeze(1)
         nbatches = query.size(0)
 
-        # 1) Do all the linear projections in batch from d_model => h x d_k
-        query = self.query_linear(query).view(nbatches, -1, self.h, self.d_k).transpose(1,2)
-        key = self.key_linear(key).view(nbatches, -1, self.h, self.d_k).transpose(1,2)
-        value = self.value_linear(value).view(nbatches, -1, self.h, self.d_k).transpose(1,2)
+        query = (
+            self.query_linear(query)
+            .view(nbatches, -1, self.h, self.d_k)
+            .transpose(1, 2)
+        )
+        key = self.key_linear(key).view(nbatches, -1, self.h, self.d_k).transpose(1, 2)
+        value = (
+            self.value_linear(value)
+            .view(nbatches, -1, self.h, self.d_k)
+            .transpose(1, 2)
+        )
 
-        # 2) Apply attention on all the projected vectors in batch.
         scores = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(self.d_k)
         if mask is not None:
             scores = scores.masked_fill(mask == 0, -1e9)
@@ -286,22 +340,21 @@ class MultiHeadedAttention(nn.Module):
 
 
 def main():
-    V = 11
+    dataset = ShakespeareDataset(num_batches=100000)
 
     model = EncoderDecoder(
         h=8,
         d_model=512,
         d_ff=2048,
         dropout=0.1,
-        N=2,
-        src_vocab=V,
-        tgt_vocab=V,
+        N=4,
+        src_vocab=dataset.V,
+        tgt_vocab=dataset.V,
     )
 
-    dataset = CopyDataset(V, num_items=40000)
-    dataloader = DataLoader(
-        dataset, batch_size=80, shuffle=True, num_workers=11, persistent_workers=True
-    )
+#    dataset = CopyDataset(V, num_items=100)
+
+    dataloader = DataLoader(dataset, batch_size=256, shuffle=True, num_workers=11, persistent_workers=True)
     iter(dataloader)
 
     tb_logger = pl_loggers.TensorBoardLogger(save_dir="logs/")
@@ -309,10 +362,17 @@ def main():
     trainer.fit(model, dataloader)
 
     model.eval()
-    src = torch.LongTensor([[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]])
+    query_string = "Talk not to me: "
+    src = torch.tensor([[dataset.mapping[char] for char in query_string]])
+    src_mask = (src != 0).unsqueeze(-2)
+
     max_len = src.shape[1]
-    src_mask = torch.ones(1, 1, max_len)
-    print(model.greedy_decode(src, src_mask, max_len=max_len, start_symbol=0))
+    out = model.greedy_decode(src, src_mask, max_len=max_len, start_symbol=0)
+
+    print("".join([dataset.reverse_mapping[int(idx.item())] for idx in out.squeeze()]))
+
+
+    print("hi")
 
 
 if __name__ == "__main__":
