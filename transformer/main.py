@@ -10,6 +10,14 @@ from torch.utils.data import DataLoader, Dataset
 
 import datasets
 
+from tokenizers import Tokenizer
+from tokenizers.models import BPE
+import tokenizers.pre_tokenizers as pre_tokenizers
+import tokenizers.processors as processors
+import tokenizers.decoders as decoders
+from tokenizers.trainers import BpeTrainer
+
+
 class ShakespeareDataset(Dataset):
 
     def __init__(self, seq_len=128, num_batches=10000):
@@ -18,10 +26,21 @@ class ShakespeareDataset(Dataset):
         self.num_batches = num_batches
 
         self.data = datasets.load_dataset('tiny_shakespeare')['train']['text'][0]
+
         self.vocabulary = sorted(set(self.data))
         self.V = len(self.vocabulary)
         self.mapping = {char: idx for idx, char in enumerate(self.vocabulary)}
         self.reverse_mapping = {idx: char for idx, char in enumerate(self.vocabulary)}
+
+        self.tokenizer = Tokenizer(BPE())
+
+        self.tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+        self.tokenizer.post_processor = processors.ByteLevel(trim_offsets=False)
+        self.tokenizer.decoder = decoders.ByteLevel()
+        trainer = BpeTrainer(special_tokens=['<|endoftext|>'], min_frequency=2)
+        self.tokenizer.train(['shakespeare.txt'], trainer)
+
+        self.data = torch.tensor(self.tokenizer.encode(self.data).ids, dtype=torch.long)
 
     def __len__(self):
         return self.num_batches
@@ -32,13 +51,13 @@ class ShakespeareDataset(Dataset):
         # Get text from the dataset of length self.seq_len
         text = self.data[start_idx:start_idx + self.seq_len]
 
-        # Apply character-level encoding
-        encoded_text = torch.tensor([self.mapping[char] for char in text])
+        # Apply byte pair encoding
+#        encoded_text = torch.tensor([self.mapping[char] for char in text])
 
-        src = encoded_text
+        src = text
         src_mask = (src != self.pad).unsqueeze(-2)
-        tgt = encoded_text[:-1]
-        tgt_y = encoded_text[1:]
+        tgt = text[:-1]
+        tgt_y = text[1:]
         tgt_mask = (tgt != self.pad).unsqueeze(-2)
 
         subsequent_mask = torch.triu(torch.ones((1, tgt.size(-1), tgt.size(-1))), diagonal=1).type( torch.uint8) == 0
